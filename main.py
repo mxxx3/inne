@@ -1,68 +1,93 @@
+import asyncio
 import logging
-import os
-import pytz
-import apscheduler.schedulers.base
-from collections import OrderedDict
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from telegram.constants import ParseMode
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
 from deep_translator import GoogleTranslator
 
-# Patch dla Windowsa (bezpieczny na Linuxie)
-def fixed_astimezone(obj): return pytz.utc
-apscheduler.schedulers.base.astimezone = fixed_astimezone
-os.environ['TZ'] = 'UTC'
+# --- KONFIGURACJA ---
+# Token bota z BotFather
+BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
-# POBIERANIE TOKENA Z SYSTEMU (KOYEB SECRETS)
-TOKEN = os.getenv('BOT_TOKEN') 
-GROUP_ID = -1003537210812
-TOPIC_POLSKI = None
-TOPIC_INNY = 4925
+# ID Twoich grup
+GROUP_A_ID = -1003676480681  # Grom
+GROUP_B_ID = -1003537210812  # Aka Grom
 
-BRIDGE = {
-    TOPIC_POLSKI: {"target": TOPIC_INNY, "lang": "id"},
-    TOPIC_INNY:   {"target": TOPIC_POLSKI, "lang": "pl"}
-}
+# ID konkretnych Tematów (Topics)
+TOPIC_A_ID = 11957           # Temat w Grom
+TOPIC_B_ID = 7367            # Temat w Aka Grom
 
-msg_map = OrderedDict()
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Konfiguracja logowania
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-async def handle_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.message.from_user.is_bot: return
-    chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id
-    if chat_id != GROUP_ID or thread_id not in BRIDGE: return
-    
-    dest = BRIDGE[thread_id]
-    user_name = update.message.from_user.first_name or "Użytkownik"
-    text = update.message.text or update.message.caption
-    if not text: return
+# Inicjalizacja bota
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-    # Logika Reply (Odpowiedzi)
-    reply_to_id = msg_map.get(update.message.reply_to_message.message_id) if update.message.reply_to_message else None
-
+@dp.message(F.chat.id.in_({GROUP_A_ID, GROUP_B_ID}))
+async def bridge_handler(message: types.Message):
+    """Przesyłanie wiadomości między wybranymi tematami"""
     try:
-        translated = GoogleTranslator(source='auto', target=dest["lang"]).translate(text)
-        final_msg = f"**{user_name}**: {translated}"
-        
-        if update.message.photo:
-            sent_msg = await context.bot.send_photo(chat_id=GROUP_ID, message_thread_id=dest["target"],
-                photo=update.message.photo[-1].file_id, caption=final_msg,
-                parse_mode=ParseMode.MARKDOWN, reply_to_message_id=reply_to_id)
+        # Zabezpieczenie przed botami i pętlą
+        if message.from_user.is_bot:
+            return
+
+        # Filtracja tematów i kierunek przesyłu
+        if message.chat.id == GROUP_A_ID:
+            if message.message_thread_id != TOPIC_A_ID:
+                return
+            target_chat = GROUP_B_ID
+            target_topic = TOPIC_B_ID
+            source_label = "Grom"
+        elif message.chat.id == GROUP_B_ID:
+            if message.message_thread_id != TOPIC_B_ID:
+                return
+            target_chat = GROUP_A_ID
+            target_topic = TOPIC_A_ID
+            source_label = "Aka Grom"
         else:
-            sent_msg = await context.bot.send_message(chat_id=GROUP_ID, message_thread_id=dest["target"],
-                text=final_msg, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=reply_to_id)
+            return
+
+        # Pobranie tekstu i tłumaczenie
+        sender_name = message.from_user.full_name
+        original_text = message.text or message.caption or ""
         
-        if sent_msg:
-            msg_map[update.message.message_id] = sent_msg.message_id
-            if len(msg_map) > 1000: msg_map.popitem(last=False)
+        translated = original_text
+        if original_text:
+            try:
+                translated = GoogleTranslator(source='auto', target='pl').translate(original_text)
+            except:
+                translated = original_text
+
+        caption = f"👤 **{sender_name}** ({source_label}):\n\n{translated}"
+
+        # Przesyłanie (zdjęcia/filmy lub sam tekst)
+        if message.photo or message.video or message.document:
+            await message.copy_to(
+                chat_id=target_chat,
+                message_thread_id=target_topic,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await bot.send_message(
+                chat_id=target_chat,
+                text=caption,
+                message_thread_id=target_topic,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        logger.info(f"Przesłano wiadomość od {sender_name}")
+
     except Exception as e:
-        logging.error(f"Błąd: {e}")
+        logger.error(f"Błąd: {e}")
+
+async def main():
+    logger.info("Bot startuje...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    if not TOKEN:
-        print("BŁĄD: Nie znaleziono zmiennej BOT_TOKEN!")
-    else:
-        app = ApplicationBuilder().token(TOKEN).job_queue(None).build()
-        app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & (~filters.COMMAND), handle_bridge))
-        app.run_polling()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot wyłączony.")

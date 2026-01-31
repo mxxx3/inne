@@ -1,4 +1,2 @@
-python-telegram-bot
+aiogram
 deep-translator
-pytz
-apscheduler

@@ -17,7 +17,6 @@ TOPIC_A_ID = 11957           # Temat w Grom
 TOPIC_B_ID = 7367            # Temat w Aka Grom
 
 # Słownik do przechowywania powiązań między wiadomościami (ID mapowanie)
-# Pozwala na poprawne działanie odpowiedzi (replies) między grupami
 msg_mapping = {}
 
 # Konfiguracja logowania
@@ -30,7 +29,7 @@ dp = Dispatcher()
 
 @dp.message(F.chat.id.in_({GROUP_A_ID, GROUP_B_ID}))
 async def bridge_handler(message: types.Message):
-    """Przesyłanie wiadomości z poprawną obsługą odpowiedzi (replies)"""
+    """Przesyłanie wiadomości z precyzyjną obsługą odpowiedzi (replies)"""
     try:
         # Ignoruj boty
         if message.from_user.is_bot:
@@ -56,16 +55,18 @@ async def bridge_handler(message: types.Message):
         reply_to_id = None
         reply_info = ""
         
-        if message.reply_to_message:
+        # Sprawdzamy, czy to PRAWDZIWA odpowiedź na wiadomość (nie na start tematu)
+        if message.reply_to_message and message.reply_to_message.message_id != message.message_thread_id:
             orig_reply_id = message.reply_to_message.message_id
-            # Szukamy ID wiadomości w grupie docelowej
+            
+            # Pobieramy zmapowane ID w grupie docelowej
             reply_to_id = msg_mapping.get(orig_reply_id)
             
             # Pobieranie imienia osoby, której odpowiadamy
             replied_msg = message.reply_to_message
             bot_info = await bot.get_me()
             
-            # Jeśli odpowiadamy na wiadomość bota, wyciągamy imię z treści (między gwiazdkami)
+            # Jeśli odpowiadamy na post bota, wyciągamy imię z treści
             if replied_msg.from_user.id == bot_info.id:
                 content = replied_msg.text or replied_msg.caption or ""
                 match = re.search(r"\*\*([^\*]+)\*\*", content)
@@ -90,6 +91,7 @@ async def bridge_handler(message: types.Message):
 
         sent_msg = None
         # Przesyłanie mediów lub tekstu
+        # Używamy target_topic jako domyślnego ID wątku, ale reply_to_id jeśli istnieje prawdziwa odpowiedź
         if message.photo or message.video or message.document or message.audio:
             sent_msg = await message.copy_to(
                 chat_id=target_chat,
@@ -107,25 +109,25 @@ async def bridge_handler(message: types.Message):
                 parse_mode=ParseMode.MARKDOWN
             )
 
-        # --- ZAPISYWANIE POWIĄZANIA (OBIE STRONY) ---
+        # --- ZAPISYWANIE POWIĄZANIA ---
         if sent_msg:
-            # Kluczowe: mapujemy ID w obie strony, żeby odpowiedzi działały płynnie
+            # Mapujemy ID w obie strony
             msg_mapping[message.message_id] = sent_msg.message_id
             msg_mapping[sent_msg.message_id] = message.message_id
             
-            # Czyszczenie pamięci (limit 2000 wpisów, bo mapujemy podwójnie)
+            # Czyszczenie pamięci (limit 2000 wpisów)
             if len(msg_mapping) > 2000:
-                for _ in range(10):
-                    first_key = next(iter(msg_mapping))
-                    del msg_mapping[first_key]
+                keys_to_remove = list(msg_mapping.keys())[:100]
+                for k in keys_to_remove:
+                    msg_mapping.pop(k, None)
 
-        logger.info(f"Przesłano od {sender_name}. Powiązanie: {message.message_id} <-> {sent_msg.message_id if sent_msg else 'None'}")
+        logger.info(f"Przesłano od {sender_name}. Reply ID: {reply_to_id}")
 
     except Exception as e:
-        logger.error(f"Błąd: {e}")
+        logger.error(f"Błąd mostu: {e}")
 
 async def main():
-    logger.info("Bot startuje z poprawioną obsługą odpowiedzi...")
+    logger.info("Bot startuje z naprawioną filtracją odpowiedzi w tematach...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from deep_translator import GoogleTranslator
@@ -29,7 +30,7 @@ dp = Dispatcher()
 
 @dp.message(F.chat.id.in_({GROUP_A_ID, GROUP_B_ID}))
 async def bridge_handler(message: types.Message):
-    """Przesyłanie wiadomości z obsługą odpowiedzi (replies)"""
+    """Przesyłanie wiadomości z poprawną obsługą odpowiedzi (replies)"""
     try:
         # Ignoruj boty
         if message.from_user.is_bot:
@@ -51,19 +52,30 @@ async def bridge_handler(message: types.Message):
         else:
             return
 
-        # Sprawdzenie czy wiadomość jest odpowiedzią
+        # --- LOGIKA ODPOWIEDZI (REPLY) ---
         reply_to_id = None
         reply_info = ""
+        
         if message.reply_to_message:
-            # Szukamy czy mamy w pamięci ID wiadomości, na którą ktoś odpowiada
             orig_reply_id = message.reply_to_message.message_id
+            # Szukamy ID wiadomości w grupie docelowej
             reply_to_id = msg_mapping.get(orig_reply_id)
             
-            # Dodatkowy tekst informujący na kogo odpowiadamy (wizualny)
-            replied_to_name = message.reply_to_message.from_user.full_name
+            # Pobieranie imienia osoby, której odpowiadamy
+            replied_msg = message.reply_to_message
+            bot_info = await bot.get_me()
+            
+            # Jeśli odpowiadamy na wiadomość bota, wyciągamy imię z treści (między gwiazdkami)
+            if replied_msg.from_user.id == bot_info.id:
+                content = replied_msg.text or replied_msg.caption or ""
+                match = re.search(r"\*\*([^\*]+)\*\*", content)
+                replied_to_name = match.group(1) if match else "Użytkownik"
+            else:
+                replied_to_name = replied_msg.from_user.full_name
+                
             reply_info = f"↩️ Odpowiedź dla **{replied_to_name}**\n"
 
-        # Tłumaczenie
+        # --- TŁUMACZENIE I TREŚĆ ---
         sender_name = message.from_user.full_name
         original_text = message.text or message.caption or ""
         
@@ -82,7 +94,7 @@ async def bridge_handler(message: types.Message):
             sent_msg = await message.copy_to(
                 chat_id=target_chat,
                 message_thread_id=target_topic,
-                reply_to_message_id=reply_to_id, # Tutaj bot podpina odpowiedź
+                reply_to_message_id=reply_to_id,
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -91,25 +103,29 @@ async def bridge_handler(message: types.Message):
                 chat_id=target_chat,
                 text=caption,
                 message_thread_id=target_topic,
-                reply_to_message_id=reply_to_id, # Tutaj bot podpina odpowiedź
+                reply_to_message_id=reply_to_id,
                 parse_mode=ParseMode.MARKDOWN
             )
 
-        # Zapisujemy powiązanie ID wiadomości w pamięci
+        # --- ZAPISYWANIE POWIĄZANIA (OBIE STRONY) ---
         if sent_msg:
+            # Kluczowe: mapujemy ID w obie strony, żeby odpowiedzi działały płynnie
             msg_mapping[message.message_id] = sent_msg.message_id
-            # Czyścimy stare wpisy jeśli słownik jest zbyt duży (limit 1000 wiadomości)
-            if len(msg_mapping) > 1000:
-                first_key = next(iter(msg_mapping))
-                del msg_mapping[first_key]
+            msg_mapping[sent_msg.message_id] = message.message_id
+            
+            # Czyszczenie pamięci (limit 2000 wpisów, bo mapujemy podwójnie)
+            if len(msg_mapping) > 2000:
+                for _ in range(10):
+                    first_key = next(iter(msg_mapping))
+                    del msg_mapping[first_key]
 
-        logger.info(f"Przesłano wiadomość od {sender_name} (Odpowiedź: {'Tak' if reply_to_id else 'Nie'})")
+        logger.info(f"Przesłano od {sender_name}. Powiązanie: {message.message_id} <-> {sent_msg.message_id if sent_msg else 'None'}")
 
     except Exception as e:
         logger.error(f"Błąd: {e}")
 
 async def main():
-    logger.info("Bot startuje z obsługą odpowiedzi (replies)...")
+    logger.info("Bot startuje z poprawioną obsługą odpowiedzi...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

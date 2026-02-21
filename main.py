@@ -11,10 +11,10 @@ from deep_translator import GoogleTranslator
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
 GROUP_A_ID = -1003676480681  # Grom
-GROUP_B_ID = -1003537210812  # Aka Grom
+GROUP_B_ID = -1003676480681  # translator
 
-TOPIC_A_ID = 11957           # Temat w Grom
-TOPIC_B_ID = 7367            # Temat w Aka Grom
+TOPIC_A_ID = 0           # Temat w Grom
+TOPIC_B_ID = 27893            # Temat w Aka Grom
 
 # Słownik do mapowania odpowiedzi
 msg_mapping = {}
@@ -121,3 +121,4 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+

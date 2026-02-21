@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sqlite3
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
@@ -11,12 +12,16 @@ BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 # ID grupy głównej
 GROUP_ID = -1003676480681  
 
-# ID tematów
-TOPIC_GENERAL_ID = 0      # General (Główny)
-TOPIC_TRANSLATOR_ID = 27893 # Translator
+# ID tematów (podgrup)
+TOPIC_GENERAL_ID = 0      
+TOPIC_TRANSLATOR_ID = 27893 
 
-# Słownik do mapowania ID wiadomości dla odpowiedzi (replies)
-msg_mapping = {}
+# Ustawienia wydajności
+MAX_WORKERS = 4  # Liczba równoległych tłumaczy w tle
+DB_PATH = "translator_cache.db"
+
+# Kolejka zadań
+translation_queue = asyncio.Queue()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -24,103 +29,151 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-def translate_content(text, target_lang):
-    """Tłumaczy tekst na wskazany język docelowy"""
+# --- OBSŁUGA BAZY DANYCH (SQLite) ---
+def init_db():
+    """Inicjalizacja bazy danych na dysku"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS message_map (
+            orig_id INTEGER PRIMARY KEY,
+            trans_id INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_mapping(orig_id, trans_id):
+    """Zapisuje powiązanie wiadomości w obie strony"""
     try:
-        return GoogleTranslator(source='auto', target=target_lang).translate(text)
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO message_map (orig_id, trans_id) VALUES (?, ?)", (orig_id, trans_id))
+        cursor.execute("INSERT OR REPLACE INTO message_map (orig_id, trans_id) VALUES (?, ?)", (trans_id, orig_id))
+        conn.commit()
+        
+        # Automatyczne czyszczenie bazy, jeśli przekroczy 10 000 wpisów (dbamy o wydajność)
+        cursor.execute("SELECT COUNT(*) FROM message_map")
+        if cursor.fetchone()[0] > 20000:
+            cursor.execute("DELETE FROM message_map WHERE orig_id IN (SELECT orig_id FROM message_map LIMIT 1000)")
+            conn.commit()
+        conn.close()
     except Exception as e:
-        logger.error(f"Błąd tłumaczenia: {e}")
-        return text
+        logger.error(f"Błąd zapisu DB: {e}")
+
+def get_mapping(orig_id):
+    """Pobiera ID zmapowanej wiadomości"""
+    if not orig_id: return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT trans_id FROM message_map WHERE orig_id = ?", (orig_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Błąd odczytu DB: {e}")
+        return None
+
+# --- LOGIKA TŁUMACZENIA ---
+async def perform_translation(text, target_lang):
+    try:
+        translator = GoogleTranslator(source='auto', target=target_lang)
+        return await asyncio.to_thread(translator.translate, text)
+    except Exception as e:
+        logger.error(f"Błąd API tłumacza: {e}")
+        return None
+
+async def translation_worker(worker_id):
+    """Pracownik przetwarzający kolejkę"""
+    logger.info(f"Worker {worker_id} gotowy do pracy.")
+    while True:
+        task = await translation_queue.get()
+        try:
+            message, target_topic, target_lang, source_label = task
+            original_text = message.text or message.caption or ""
+            
+            if not original_text.strip():
+                translation_queue.task_done()
+                continue
+
+            translated = await perform_translation(original_text, target_lang)
+            if not translated:
+                translated = f"[Timeout] {original_text}"
+
+            # Sprawdzenie mapowania dla odpowiedzi (z bazy danych)
+            reply_to_id = None
+            if message.reply_to_message:
+                reply_to_id = get_mapping(message.reply_to_message.message_id)
+            
+            sender = message.from_user.full_name
+            final_text = f"👤 **{sender}** ({source_label}):\n\n{translated}"
+            send_to_thread = target_topic if target_topic != 0 else None
+
+            sent = None
+            if any([message.photo, message.video, message.document, message.audio, message.voice]):
+                sent = await message.copy_to(
+                    chat_id=GROUP_ID,
+                    message_thread_id=send_to_thread,
+                    reply_to_message_id=reply_to_id,
+                    caption=final_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                sent = await bot.send_message(
+                    chat_id=GROUP_ID,
+                    text=final_text,
+                    message_thread_id=send_to_thread,
+                    reply_to_message_id=reply_to_id,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+
+            if sent:
+                save_mapping(message.message_id, sent.message_id)
+
+        except Exception as e:
+            logger.error(f"Błąd workera {worker_id}: {e}")
+        
+        translation_queue.task_done()
 
 # --- KOMENDA /id ---
 @dp.message(Command("id"))
 async def get_ids(message: types.Message):
     t_id = message.message_thread_id if message.message_thread_id is not None else 0
-    await message.reply(
-        f"📊 **Dane diagnostyczne:**\n"
-        f"🆔 Chat ID: `{message.chat.id}`\n"
-        f"🧵 Topic ID: `{t_id}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await message.reply(f"📊 Chat: `{message.chat.id}` | Topic: `{t_id}`")
 
-# --- OBSŁUGA MOSTU ---
+# --- PRZYJMOWANIE WIADOMOŚCI ---
 @dp.message()
 async def bridge_handler(message: types.Message):
     if message.from_user.is_bot or (message.text and message.text.startswith("/")):
         return
 
-    try:
-        current_topic = message.message_thread_id if message.message_thread_id is not None else 0
-        
-        target_topic = None
-        target_lang = None
-        source_label = ""
+    current_topic = message.message_thread_id if message.message_thread_id is not None else 0
+    
+    target_topic = None
+    target_lang = None
+    source_label = ""
 
-        # LOGIKA KIERUNKOWA:
-        # 1. Z General (0) -> Translator (27893) | Tłumacz na Angielski
-        if message.chat.id == GROUP_ID and current_topic == TOPIC_GENERAL_ID:
-            target_topic = TOPIC_TRANSLATOR_ID
-            target_lang = 'en'
-            source_label = "General"
+    if message.chat.id == GROUP_ID and current_topic == TOPIC_GENERAL_ID:
+        target_topic = TOPIC_TRANSLATOR_ID
+        target_lang = 'en'
+        source_label = "General"
+    elif message.chat.id == GROUP_ID and current_topic == TOPIC_TRANSLATOR_ID:
+        target_topic = TOPIC_GENERAL_ID
+        target_lang = 'pl'
+        source_label = "Translator"
 
-        # 2. Z Translator (27893) -> General (0) | Tłumacz na Polski
-        elif message.chat.id == GROUP_ID and current_topic == TOPIC_TRANSLATOR_ID:
-            target_topic = TOPIC_GENERAL_ID
-            target_lang = 'pl'
-            source_label = "Translator"
-
-        if target_topic is None:
-            return
-
-        # Obsługa odpowiedzi (Reply)
-        reply_to_id = msg_mapping.get(message.reply_to_message.message_id) if message.reply_to_message else None
-        # Ignoruj reply jeśli to tylko przypięta wiadomość lub start wątku
-        if message.reply_to_message and message.reply_to_message.message_id == message.message_thread_id:
-            reply_to_id = None
-
-        # Tłumaczenie
-        original_text = message.text or message.caption or ""
-        translated = translate_content(original_text, target_lang) if original_text else ""
-        
-        sender = message.from_user.full_name
-        final_caption = f"👤 **{sender}** ({source_label}):\n\n{translated}"
-
-        # Ustalenie ID wątku dla Telegrama (0 musi być wysłane jako None)
-        send_to_thread = target_topic if target_topic != 0 else None
-
-        # Wysyłka
-        if any([message.photo, message.video, message.document, message.audio, message.voice]):
-            sent = await message.copy_to(
-                chat_id=GROUP_ID,
-                message_thread_id=send_to_thread,
-                reply_to_message_id=reply_to_id,
-                caption=final_caption,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            sent = await bot.send_message(
-                chat_id=GROUP_ID,
-                text=final_caption,
-                message_thread_id=send_to_thread,
-                reply_to_message_id=reply_to_id,
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-        # Zapisanie powiązania wiadomości
-        if sent:
-            msg_mapping[message.message_id] = sent.message_id
-            msg_mapping[sent.message_id] = message.message_id
-            
-            # Czyszczenie pamięci
-            if len(msg_mapping) > 4000:
-                for _ in range(100):
-                    msg_mapping.pop(next(iter(msg_mapping)), None)
-
-    except Exception as e:
-        logger.error(f"Błąd mostu: {e}")
+    if target_topic is not None:
+        await translation_queue.put((message, target_topic, target_lang, source_label))
 
 async def main():
-    logger.info("Bot translator uruchomiony...")
+    logger.info("Inicjalizacja bazy danych...")
+    init_db()
+    
+    logger.info("Uruchamianie pracowników...")
+    for i in range(MAX_WORKERS):
+        asyncio.create_task(translation_worker(i + 1))
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

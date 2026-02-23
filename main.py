@@ -9,15 +9,18 @@ from deep_translator import GoogleTranslator
 # --- KONFIGURACJA ---
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
-# ID grupy głównej
-GROUP_ID = -1003676480681  
+# ID Grupy Głównej (General i Translator)
+GROUP_MAIN_ID = -1003676480681  
+# ID Nowej Grupy (Grom tłum)
+GROUP_GROM_ID = -1003772687355  
 
-# ID tematów (podgrup)
-TOPIC_GENERAL_ID = 0      
-TOPIC_TRANSLATOR_ID = 27893 
+# ID Tematów
+TOPIC_GENERAL_ID = 0         # Na GROUP_MAIN_ID
+TOPIC_TRANSLATOR_ID = 27893  # Na GROUP_MAIN_ID
+TOPIC_GROM_ID = 0            # Na GROUP_GROM_ID
 
 # Ustawienia wydajności
-MAX_WORKERS = 4  
+MAX_WORKERS = 5  
 DB_PATH = "translator_cache.db"
 
 # Kolejka zadań
@@ -31,110 +34,105 @@ dp = Dispatcher()
 
 # --- OBSŁUGA BAZY DANYCH (SQLite) ---
 def init_db():
-    """Inicjalizacja bazy danych SQLite dla mapowania wiadomości"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS message_map (
-            orig_id INTEGER PRIMARY KEY,
-            trans_id INTEGER
+            orig_chat_id INTEGER,
+            orig_msg_id INTEGER,
+            trans_chat_id INTEGER,
+            trans_msg_id INTEGER,
+            PRIMARY KEY (orig_chat_id, orig_msg_id, trans_chat_id)
         )
     ''')
     conn.commit()
     conn.close()
 
-def save_mapping(orig_id, trans_id):
-    """Zapisuje powiązanie ID wiadomości w bazie"""
+def save_mapping(o_chat, o_msg, t_chat, t_msg):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO message_map (orig_id, trans_id) VALUES (?, ?)", (orig_id, trans_id))
-        cursor.execute("INSERT OR REPLACE INTO message_map (orig_id, trans_id) VALUES (?, ?)", (trans_id, orig_id))
+        # Zapisujemy w obie strony, aby reply działał w każdym kierunku
+        cursor.execute("INSERT OR REPLACE INTO message_map VALUES (?, ?, ?, ?)", (o_chat, o_msg, t_chat, t_msg))
+        cursor.execute("INSERT OR REPLACE INTO message_map VALUES (?, ?, ?, ?)", (t_chat, t_msg, o_chat, o_msg))
         conn.commit()
-        
-        # Ograniczenie wielkości bazy do ostatnich 20k rekordów
-        cursor.execute("SELECT COUNT(*) FROM message_map")
-        if cursor.fetchone()[0] > 20000:
-            cursor.execute("DELETE FROM message_map WHERE orig_id IN (SELECT orig_id FROM message_map LIMIT 1000)")
-            conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Błąd SQLite (zapis): {e}")
+        logger.error(f"Błąd SQLite (save): {e}")
 
-def get_mapping(orig_id):
-    """Pobiera zmapowane ID dla odpowiedzi (reply)"""
-    if not orig_id: return None
+def get_mapping(target_chat_id, reply_to_msg_id):
+    """Szuka ID wiadomości w czacie docelowym, która odpowiada tej, na którą odpisano"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT trans_id FROM message_map WHERE orig_id = ?", (orig_id,))
+        cursor.execute(
+            "SELECT trans_msg_id FROM message_map WHERE orig_msg_id = ? AND trans_chat_id = ?", 
+            (reply_to_msg_id, target_chat_id)
+        )
         result = cursor.fetchone()
         conn.close()
         return result[0] if result else None
     except Exception as e:
-        logger.error(f"Błąd SQLite (odczyt): {e}")
+        logger.error(f"Błąd SQLite (get): {e}")
         return None
 
 # --- LOGIKA TŁUMACZENIA ---
 async def perform_translation(text, target_lang):
-    """Tłumaczenie tekstu w osobnym wątku"""
     try:
         translator = GoogleTranslator(source='auto', target=target_lang)
         return await asyncio.to_thread(translator.translate, text)
     except Exception as e:
-        logger.error(f"Błąd Google Translate: {e}")
+        logger.error(f"Błąd API: {e}")
         return None
 
 async def translation_worker(worker_id):
-    """Pracownik przetwarzający kolejkę w tle"""
-    logger.info(f"Worker {worker_id} wystartował.")
+    logger.info(f"Worker {worker_id} aktywny.")
     while True:
         task = await translation_queue.get()
         try:
-            message, target_topic, target_lang, source_label = task
+            message, targets, target_lang, source_label = task
             original_text = message.text or message.caption or ""
             
-            # Tłumacz tylko jeśli jest tekst
-            translated = await perform_translation(original_text, target_lang) if original_text.strip() else ""
-            
-            if original_text.strip() and not translated:
-                translated = f"[Błąd tłumaczenia] {original_text}"
+            translated = ""
+            if original_text.strip():
+                translated = await perform_translation(original_text, target_lang)
+                if not translated:
+                    translated = f"[Błąd] {original_text}"
 
-            # Pobranie ID wiadomości do której jest to odpowiedź
-            reply_to_id = None
-            if message.reply_to_message:
-                reply_to_id = get_mapping(message.reply_to_message.message_id)
-            
             sender = message.from_user.full_name
             final_text = f"👤 **{sender}** ({source_label}):\n\n{translated}"
-            send_to_thread = target_topic if target_topic != 0 else None
 
-            sent = None
-            # Rozszerzona lista mediów (dodano message.animation dla GIFów)
-            media_check = [
-                message.photo, message.video, message.animation, 
-                message.document, message.audio, message.voice
-            ]
-            
-            if any(media_check):
-                sent = await message.copy_to(
-                    chat_id=GROUP_ID,
-                    message_thread_id=send_to_thread,
-                    reply_to_message_id=reply_to_id,
-                    caption=final_text,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                sent = await bot.send_message(
-                    chat_id=GROUP_ID,
-                    text=final_text,
-                    message_thread_id=send_to_thread,
-                    reply_to_message_id=reply_to_id,
-                    parse_mode=ParseMode.MARKDOWN
-                )
+            # Wysyłka do wszystkich celów (np. General -> Translator + Grom)
+            for target_chat, target_topic in targets:
+                # Szukamy czy to odpowiedź (Reply) i czy mamy zmapowane ID w tym czacie
+                reply_id = None
+                if message.reply_to_message:
+                    reply_id = get_mapping(target_chat, message.reply_to_message.message_id)
 
-            if sent:
-                save_mapping(message.message_id, sent.message_id)
+                send_thread = target_topic if target_topic != 0 else None
+                
+                sent = None
+                media_check = [message.photo, message.video, message.animation, message.document, message.audio, message.voice]
+                
+                if any(media_check):
+                    sent = await message.copy_to(
+                        chat_id=target_chat,
+                        message_thread_id=send_thread,
+                        reply_to_message_id=reply_id,
+                        caption=final_text,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                else:
+                    sent = await bot.send_message(
+                        chat_id=target_chat,
+                        text=final_text,
+                        message_thread_id=send_thread,
+                        reply_to_message_id=reply_id,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+
+                if sent:
+                    save_mapping(message.chat.id, message.message_id, target_chat, sent.message_id)
 
         except Exception as e:
             logger.error(f"Błąd w workerze {worker_id}: {e}")
@@ -145,40 +143,46 @@ async def translation_worker(worker_id):
 @dp.message(Command("id"))
 async def get_ids(message: types.Message):
     t_id = message.message_thread_id if message.message_thread_id is not None else 0
-    await message.reply(f"📊 Chat ID: `{message.chat.id}` | Topic ID: `{t_id}`")
+    await message.reply(f"📊 Chat: `{message.chat.id}` | Topic: `{t_id}`")
 
 # --- PRZYJMOWANIE WIADOMOŚCI ---
 @dp.message()
 async def bridge_handler(message: types.Message):
-    # Ignoruj boty i komendy
     if message.from_user.is_bot or (message.text and message.text.startswith("/")):
         return
 
-    current_topic = message.message_thread_id if message.message_thread_id is not None else 0
+    curr_chat = message.chat.id
+    curr_topic = message.message_thread_id if message.message_thread_id is not None else 0
     
-    target_topic = None
+    targets = [] # Lista krotek (chat_id, topic_id)
     target_lang = None
     source_label = ""
 
-    # General -> Translator (PL do EN)
-    if message.chat.id == GROUP_ID and current_topic == TOPIC_GENERAL_ID:
-        target_topic = TOPIC_TRANSLATOR_ID
+    # 1. Z General -> Wysyłamy do obu grup (Translator i Grom) | Tłumaczymy na Angielski
+    if curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_GENERAL_ID:
+        targets = [(GROUP_MAIN_ID, TOPIC_TRANSLATOR_ID), (GROUP_GROM_ID, TOPIC_GROM_ID)]
         target_lang = 'en'
         source_label = "General"
-    # Translator -> General (EN do PL)
-    elif message.chat.id == GROUP_ID and current_topic == TOPIC_TRANSLATOR_ID:
-        target_topic = TOPIC_GENERAL_ID
+
+    # 2. Z Translator -> Wysyłamy do General | Tłumaczymy na Polski
+    elif curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_TRANSLATOR_ID:
+        targets = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID)]
         target_lang = 'pl'
         source_label = "Translator"
 
-    if target_topic is not None:
-        await translation_queue.put((message, target_topic, target_lang, source_label))
+    # 3. Z Grom -> Wysyłamy do General | Tłumaczymy na Polski
+    elif curr_chat == GROUP_GROM_ID and curr_topic == TOPIC_GROM_ID:
+        targets = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID)]
+        target_lang = 'pl'
+        source_label = "Grom"
+
+    if targets:
+        await translation_queue.put((message, targets, target_lang, source_label))
 
 async def main():
     init_db()
     for i in range(MAX_WORKERS):
         asyncio.create_task(translation_worker(i + 1))
-    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

@@ -161,7 +161,7 @@ async def bridge_handler(message: types.Message):
     # 1. Z General -> Wysyłamy do obu grup (Translator i Grom) | Tłumaczymy na Angielski
     if curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_GENERAL_ID:
         targets = [(GROUP_MAIN_ID, TOPIC_TRANSLATOR_ID), (GROUP_GROM_ID, TOPIC_GROM_ID)]
-        target_lang = 'en'
+        target_lang = 'es'
         source_label = "General"
 
     # 2. Z Translator -> Wysyłamy do General | Tłumaczymy na Polski
@@ -191,3 +191,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+

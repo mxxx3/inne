@@ -1,11 +1,10 @@
 import asyncio
 import logging
 import sqlite3
-import html
+import html  # Standardowa biblioteka Pythona do obsługi HTML
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
-from aiogram.utils.html import escape as html_escape
 from deep_translator import GoogleTranslator
 
 # --- KONFIGURACJA ---
@@ -101,29 +100,30 @@ async def translation_worker(worker_id):
             # Przygotowanie danych nadawcy w formacie HTML
             user = message.from_user
             if user:
-                safe_name = html_escape(user.full_name)
-                # Link tg://user?id= otwiera profil po kliknięciu w imię
+                # Używamy html.escape zamiast funkcji z aiogram
+                safe_name = html.escape(user.full_name)
                 user_link = f'<b><a href="tg://user?id={user.id}">{safe_name}</a></b>'
             else:
                 user_link = "<b>Użytkownik</b>"
             
             for target_chat, target_topic, lang in target_configs:
-                # Tłumaczenie (z pamięcią podręczną dla sesji wiadomości)
+                # Tłumaczenie
                 if lang not in translated_cache:
                     if original_text.strip():
                         res = await perform_translation(original_text, lang)
-                        translated_cache[lang] = html_escape(res) if res else "<i>Błąd tłumaczenia</i>"
+                        # Zabezpieczamy tekst przed błędami HTML
+                        translated_cache[lang] = html.escape(res) if res else "<i>Błąd tłumaczenia</i>"
                     else:
                         translated_cache[lang] = ""
 
                 content = translated_cache[lang]
                 
-                # Budowanie wiadomości - pogrubiona etykieta nie jest klikalna/kopiowalna automatycznie
+                # Budowanie wiadomości
                 header = f"<b>{source_label}</b>\n👤 {user_link}\n"
                 separator = "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯"
                 final_html = f"{header}{separator}\n{content}"
                 
-                # Szukanie ID wiadomości do odpowiedzi
+                # Reply ID
                 reply_id = None
                 if message.reply_to_message:
                     reply_id = get_mapping(target_chat, message.reply_to_message.message_id)

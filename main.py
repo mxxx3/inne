@@ -90,14 +90,10 @@ async def translation_worker(worker_id):
         try:
             message, target_configs, source_label = task
             original_text = message.text or message.caption or ""
-            
-            # Słownik do cache-owania tłumaczeń (żeby nie tłumaczyć dwa razy na ten sam język)
             translated_cache = {}
-
             sender = message.from_user.full_name
             
             for target_chat, target_topic, lang in target_configs:
-                # Jeśli jeszcze nie mamy tłumaczenia na ten język, wykonujemy je
                 if lang not in translated_cache:
                     if original_text.strip():
                         res = await perform_translation(original_text, lang)
@@ -108,14 +104,14 @@ async def translation_worker(worker_id):
                 content = translated_cache[lang]
                 final_text = f"👤 **{sender}** ({source_label}):\n\n{content}"
                 
-                # Obsługa odpowiedzi
                 reply_id = None
                 if message.reply_to_message:
                     reply_id = get_mapping(target_chat, message.reply_to_message.message_id)
 
                 send_thread = target_topic if target_topic != 0 else None
-                
                 sent = None
+                
+                # Obsługa różnych mediów
                 media_check = [message.photo, message.video, message.animation, message.document, message.audio, message.voice]
                 
                 if any(media_check):
@@ -152,33 +148,40 @@ async def get_ids(message: types.Message):
 # --- PRZYJMOWANIE WIADOMOŚCI ---
 @dp.message()
 async def bridge_handler(message: types.Message):
+    # Ignoruj boty i komendy
     if message.from_user.is_bot or (message.text and message.text.startswith("/")):
         return
 
     curr_chat = message.chat.id
+    # Traktujemy None jako 0 dla uproszczenia logiki tematów głównych
     curr_topic = message.message_thread_id if message.message_thread_id is not None else 0
     
-    # target_configs to lista krotek: (chat_id, topic_id, target_lang)
+    # Log diagnostyczny (widoczny w logach Koyeb/konsoli)
+    logger.info(f"Wiadomość z: {curr_chat} | Temat: {curr_topic}")
+
     target_configs = []
     source_label = ""
 
-    # 1. Z General -> Wysyłamy do obu grup, ale z RÓŻNYMI językami
+    # KIERUNEK 1: Z General -> Translator (ES) i Grom (EN)
     if curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_GENERAL_ID:
         target_configs = [
-            (GROUP_MAIN_ID, TOPIC_TRANSLATOR_ID, 'es'), # Translator -> Hiszpański
-            (GROUP_GROM_ID, TOPIC_GROM_ID, 'en')       # Grom -> Angielski
+            (GROUP_MAIN_ID, TOPIC_TRANSLATOR_ID, 'es'),
+            (GROUP_GROM_ID, TOPIC_GROM_ID, 'en')
         ]
         source_label = "General"
 
-    # 2. Z Translator -> Powrót na General | Tłumaczymy na Polski
+    # KIERUNEK 2: Z Translator -> General (PL)
     elif curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_TRANSLATOR_ID:
         target_configs = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID, 'pl')]
         source_label = "Translator"
 
-    # 3. Z Grom -> Powrót na General | Tłumaczymy na Polski
-    elif curr_chat == GROUP_GROM_ID and curr_topic == TOPIC_GROM_ID:
-        target_configs = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID, 'pl')]
-        source_label = "Grom"
+    # KIERUNEK 3: Z Grom -> General (PL)
+    # Sprawdzamy sam Chat ID, jeśli Topic ID jest 0 lub None
+    elif curr_chat == GROUP_GROM_ID:
+        # Dodatkowe sprawdzenie, czy to na pewno ten wątek, jeśli grupa ma wątki
+        if curr_topic == TOPIC_GROM_ID:
+            target_configs = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID, 'pl')]
+            source_label = "Grom"
 
     if target_configs:
         await translation_queue.put((message, target_configs, source_label))

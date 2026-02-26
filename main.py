@@ -1,28 +1,30 @@
 import asyncio
 import logging
 import sqlite3
+import html
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
+from aiogram.utils.html import escape as html_escape
 from deep_translator import GoogleTranslator
 
 # --- KONFIGURACJA ---
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
 # ID Grup
-GROUP_MAIN_ID = -1003676480681  
-GROUP_GROM_ID = -1003772687355  
+GROUP_MAIN_ID = -1003676480681  # Grupa z General i Translator
+GROUP_GROM_ID = -1003772687355  # Nowa grupa Grom tłum
 
-# ID Tematów
+# ID Tematów (Topic IDs)
 TOPIC_GENERAL_ID = 0         
 TOPIC_TRANSLATOR_ID = 27893  
 TOPIC_GROM_ID = 0            
 
-# Ustawienia wydajności
+# Ustawienia wydajności i bazy
 MAX_WORKERS = 5  
 DB_PATH = "translator_cache.db"
 
-# Kolejka zadań
+# Kolejka zadań dla workerów
 translation_queue = asyncio.Queue()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,6 +35,7 @@ dp = Dispatcher()
 
 # --- BAZA DANYCH (SQLite) ---
 def init_db():
+    """Tworzy bazę danych do obsługi odpowiedzi (replies)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -48,6 +51,7 @@ def init_db():
     conn.close()
 
 def save_mapping(o_chat, o_msg, t_chat, t_msg):
+    """Zapisuje powiązanie wiadomości między grupami"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -56,9 +60,10 @@ def save_mapping(o_chat, o_msg, t_chat, t_msg):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Błąd SQLite: {e}")
+        logger.error(f"SQLite Save Error: {e}")
 
 def get_mapping(target_chat_id, reply_to_msg_id):
+    """Pobiera ID wiadomości docelowej dla poprawnego Reply"""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -70,20 +75,22 @@ def get_mapping(target_chat_id, reply_to_msg_id):
         conn.close()
         return result[0] if result else None
     except Exception as e:
-        logger.error(f"Błąd SQLite: {e}")
+        logger.error(f"SQLite Get Error: {e}")
         return None
 
-# --- TŁUMACZENIE ---
+# --- LOGIKA TŁUMACZENIA ---
 async def perform_translation(text, target_lang):
+    """Wykonuje tłumaczenie w osobnym wątku"""
     try:
         translator = GoogleTranslator(source='auto', target=target_lang)
         return await asyncio.to_thread(translator.translate, text)
     except Exception as e:
-        logger.error(f"Błąd API ({target_lang}): {e}")
+        logger.error(f"Translation Error ({target_lang}): {e}")
         return None
 
 async def translation_worker(worker_id):
-    logger.info(f"Worker {worker_id} aktywny.")
+    """Pracownik w tle obsługujący kolejkę"""
+    logger.info(f"Worker {worker_id} uruchomiony.")
     while True:
         task = await translation_queue.get()
         try:
@@ -91,25 +98,32 @@ async def translation_worker(worker_id):
             original_text = message.text or message.caption or ""
             translated_cache = {}
             
-            # Formatowanie autora
+            # Przygotowanie danych nadawcy w formacie HTML
             user = message.from_user
-            sender_display = f"*{user.full_name}*"
+            if user:
+                safe_name = html_escape(user.full_name)
+                # Link tg://user?id= otwiera profil po kliknięciu w imię
+                user_link = f'<b><a href="tg://user?id={user.id}">{safe_name}</a></b>'
+            else:
+                user_link = "<b>Użytkownik</b>"
             
             for target_chat, target_topic, lang in target_configs:
+                # Tłumaczenie (z pamięcią podręczną dla sesji wiadomości)
                 if lang not in translated_cache:
                     if original_text.strip():
                         res = await perform_translation(original_text, lang)
-                        translated_cache[lang] = res if res else f"_Błąd tłumaczenia_"
+                        translated_cache[lang] = html_escape(res) if res else "<i>Błąd tłumaczenia</i>"
                     else:
                         translated_cache[lang] = ""
 
                 content = translated_cache[lang]
                 
-                # Czysty interfejs bez ikon
-                header = f"`{source_label}`\n👤 {sender_display}\n"
+                # Budowanie wiadomości - pogrubiona etykieta nie jest klikalna/kopiowalna automatycznie
+                header = f"<b>{source_label}</b>\n👤 {user_link}\n"
                 separator = "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯"
-                final_text = f"{header}{separator}\n{content}"
+                final_html = f"{header}{separator}\n{content}"
                 
+                # Szukanie ID wiadomości do odpowiedzi
                 reply_id = None
                 if message.reply_to_message:
                     reply_id = get_mapping(target_chat, message.reply_to_message.message_id)
@@ -117,6 +131,7 @@ async def translation_worker(worker_id):
                 send_thread = target_topic if target_topic != 0 else None
                 sent = None
                 
+                # Media check
                 media_check = [message.photo, message.video, message.animation, message.document, message.audio, message.voice]
                 
                 if any(media_check):
@@ -124,16 +139,16 @@ async def translation_worker(worker_id):
                         chat_id=target_chat,
                         message_thread_id=send_thread,
                         reply_to_message_id=reply_id,
-                        caption=final_text,
-                        parse_mode=ParseMode.MARKDOWN
+                        caption=final_html,
+                        parse_mode=ParseMode.HTML
                     )
                 else:
                     sent = await bot.send_message(
                         chat_id=target_chat,
-                        text=final_text,
+                        text=final_html,
                         message_thread_id=send_thread,
                         reply_to_message_id=reply_id,
-                        parse_mode=ParseMode.MARKDOWN,
+                        parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True
                     )
 
@@ -141,7 +156,7 @@ async def translation_worker(worker_id):
                     save_mapping(message.chat.id, message.message_id, target_chat, sent.message_id)
 
         except Exception as e:
-            logger.error(f"Błąd worker {worker_id}: {e}")
+            logger.error(f"Błąd w workerze {worker_id}: {e}")
         
         translation_queue.task_done()
 
@@ -149,11 +164,16 @@ async def translation_worker(worker_id):
 @dp.message(Command("id"))
 async def get_ids(message: types.Message):
     t_id = message.message_thread_id if message.message_thread_id is not None else 0
-    await message.reply(f"📊 Chat: `{message.chat.id}` | Topic: `{t_id}`")
+    await message.reply(
+        f"📊 Chat ID: <code>{message.chat.id}</code>\n"
+        f"🧵 Topic ID: <code>{t_id}</code>", 
+        parse_mode=ParseMode.HTML
+    )
 
-# --- MOST ---
+# --- GŁÓWNY HANDLER MOSTU ---
 @dp.message()
 async def bridge_handler(message: types.Message):
+    # Ignoruj inne boty i komendy
     if message.from_user and message.from_user.is_bot:
         return
     if message.text and message.text.startswith("/"):
@@ -162,10 +182,10 @@ async def bridge_handler(message: types.Message):
     curr_chat = message.chat.id
     curr_topic = message.message_thread_id if message.message_thread_id is not None else 0
     
-    target_configs = []
+    target_configs = [] # (chat_id, topic_id, language)
     source_label = ""
 
-    # 1. General -> Spanish (ES) i English (EN)
+    # 1. Z General -> Spanish (ES) i English (EN)
     if curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_GENERAL_ID:
         target_configs = [
             (GROUP_MAIN_ID, TOPIC_TRANSLATOR_ID, 'es'),
@@ -173,12 +193,12 @@ async def bridge_handler(message: types.Message):
         ]
         source_label = "GENERAL"
 
-    # 2. Spanish -> General (PL)
+    # 2. Z Spanish -> General (PL)
     elif curr_chat == GROUP_MAIN_ID and curr_topic == TOPIC_TRANSLATOR_ID:
         target_configs = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID, 'pl')]
         source_label = "SPANISH"
 
-    # 3. English -> General (PL)
+    # 3. Z English -> General (PL)
     elif curr_chat == GROUP_GROM_ID and curr_topic == TOPIC_GROM_ID:
         target_configs = [(GROUP_MAIN_ID, TOPIC_GENERAL_ID, 'pl')]
         source_label = "ENGLISH"
@@ -187,9 +207,11 @@ async def bridge_handler(message: types.Message):
         await translation_queue.put((message, target_configs, source_label))
 
 async def main():
+    logger.info("Inicjalizacja bazy danych i workerów...")
     init_db()
     for i in range(MAX_WORKERS):
         asyncio.create_task(translation_worker(i + 1))
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

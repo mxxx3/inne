@@ -24,7 +24,8 @@ TOPIC_UKRAINIAN = 37575
 
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
-GEMINI_KEYS = {
+# Tutaj bot pobiera klucze GROQ z Twoich zmiennych środowiskowych w Koyeb
+GROQ_KEYS = {
     "es": os.getenv("Spain", ""),
     "en": os.getenv("English", ""),
     "ru": os.getenv("Russia", ""),
@@ -32,7 +33,8 @@ GEMINI_KEYS = {
     "pl": os.getenv("Spain", "")
 }
 
-MODEL_NAME = "gemini-2.5-flash"
+# Najszybszy i darmowy model na Groq
+MODEL_NAME = "llama3-8b-8192"
 
 # =================================================================
 # KONIEC KONFIGURACJI
@@ -90,44 +92,59 @@ def get_mapping(target_chat_id, reply_to_msg_id):
         return None
 
 async def translate_single_lang(session, text, lang_config, original_message, source_label, user_display):
-    """Tłumaczenie i wysyłka z obsługą multimediów i odpowiedzi."""
+    """Tłumaczenie przez Groq API i wysyłka do Telegrama."""
     target_chat, target_topic, lang = lang_config
-    api_key = GEMINI_KEYS.get(lang)
+    api_key = GROQ_KEYS.get(lang)
     
     if not api_key:
+        logger.error(f"Brak klucza API dla języka: {lang}")
         return
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
+    # Endpoint Groq API (zgodny z formatem OpenAI)
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Prompt optymalizujący tłumaczenie pod LLM
     payload = {
-        "contents": [{
-            "parts": [{
-                "text": f"Translate to {lang}. Only output translation. No preamble. Preserve formatting:\n\n{text}"
-            }]
-        }]
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "system", 
+                "content": f"You are a professional translator. Translate the user's message to {lang}. Preserve all formatting, emojis, and style. Output ONLY the translated text without any explanations or preamble."
+            },
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.3
     }
 
     raw_translation = None
     for attempt in range(4):
         try:
-            async with session.post(url, json=payload, timeout=12) as response:
+            async with session.post(url, json=payload, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
-                    raw_translation = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    raw_translation = data['choices'][0]['message']['content'].strip()
                     break
-                elif response.status == 429:
-                    await asyncio.sleep(1.5 ** attempt)
+                elif response.status == 429: # Flood limit Groq
+                    wait_time = (2 ** attempt) + random.uniform(1, 3)
+                    await asyncio.sleep(wait_time)
                 else:
+                    logger.error(f"Groq API Error {response.status}: {await response.text()}")
                     break
-        except Exception:
-            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Błąd połączenia z Groq: {e}")
+            await asyncio.sleep(1)
 
     if not raw_translation:
-        raw_translation = "<i>(Błąd tłumaczenia AI)</i>"
+        raw_translation = "<i>(Błąd tłumaczenia Groq)</i>"
 
     content = html.escape(raw_translation)
     final_html = f"<b>{source_label}</b>\n👤 {user_display}\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n{content}"
     
-    # Pobieranie ID wiadomości do której jest to odpowiedź w temacie docelowym
+    # Obsługa odpowiedzi (replies)
     reply_id = None
     if original_message.reply_to_message:
         reply_id = get_mapping(target_chat, original_message.reply_to_message.message_id)
@@ -140,12 +157,12 @@ async def translate_single_lang(session, text, lang_config, original_message, so
         "disable_web_page_preview": True
     }
 
-    # Milisekundowe opóźnienie przed wysyłką (staggering)
-    await asyncio.sleep(random.uniform(0.1, 0.6))
+    # Milisekundowe opóźnienie przed wysyłką do Telegrama (staggering)
+    await asyncio.sleep(random.uniform(0.15, 0.7))
 
     for retry in range(5):
         try:
-            # Sprawdzanie czy wiadomość zawiera jakiekolwiek media
+            # Obsługa mediów (obrazki, filmy itd.)
             has_media = any([
                 original_message.photo, original_message.video, 
                 original_message.animation, original_message.document, 
@@ -153,10 +170,8 @@ async def translate_single_lang(session, text, lang_config, original_message, so
             ])
 
             if has_media:
-                # Kopiowanie mediów z nowym podpisem (caption)
                 sent = await original_message.copy_to(caption=final_html, **kwargs)
             else:
-                # Wysyłka zwykłej wiadomości tekstowej
                 sent = await bot.send_message(text=final_html, **kwargs)
             
             if sent:
@@ -167,20 +182,19 @@ async def translate_single_lang(session, text, lang_config, original_message, so
             logger.warning(f"Telegram Flood! Czekam {e.retry_after}s dla {lang}")
             await asyncio.sleep(e.retry_after + 0.1)
         except Exception as e:
-            logger.error(f"Błąd wysyłki dla {lang}: {e}")
+            logger.error(f"Błąd wysyłki Telegram ({lang}): {e}")
             break
 
 async def translation_worker(worker_id):
-    logger.info(f"Worker {worker_id} ({MODEL_NAME}) aktywny.")
+    logger.info(f"Worker Groq {worker_id} aktywny.")
     async with aiohttp.ClientSession() as session:
         while True:
             task = await translation_queue.get()
             try:
                 message, target_configs, source_label = task
-                
-                # Tekst może być w .text (wiadomość) lub .caption (media)
                 original_text = message.text or message.caption or ""
                 
+                # Jeśli wiadomość jest pusta i nie ma mediów - pomiń
                 if not original_text.strip() and not any([message.photo, message.video, message.animation]):
                     translation_queue.task_done()
                     continue
@@ -189,6 +203,7 @@ async def translation_worker(worker_id):
                 safe_name = html.escape(user.full_name) if user else "Użytkownik"
                 user_display = f'<b><a href="https://t.me/{user.username}">{safe_name}</a></b>' if user and user.username else f'<b>{safe_name}</b>'
                 
+                # Równoległe tłumaczenie na wybrane języki
                 tasks = [
                     translate_single_lang(session, original_text, cfg, message, source_label, user_display)
                     for cfg in target_configs

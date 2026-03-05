@@ -24,14 +24,17 @@ TOPIC_UKRAINIAN = 37575
 # TOKEN BOTA
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
-# KLUCZE API GEMINI (Pobierane ze zmiennych środowiskowych Koyeb)
+# KLUCZE API GEMINI
 GEMINI_KEYS = {
     "es": os.getenv("Spain", ""),
     "en": os.getenv("English", ""),
     "ru": os.getenv("Russia", ""),
     "uk": os.getenv("Ukraine", ""),
-    "pl": os.getenv("Spain", "") # Klucz 'Spain' jako domyślny dla powrotów na PL
+    "pl": os.getenv("Spain", "")
 }
+
+# NAZWA MODELU ZGODNIE Z PROŚBĄ
+MODEL_NAME = "gemini-2.5-flash"
 
 # =================================================================
 # KONIEC KONFIGURACJI
@@ -71,7 +74,7 @@ def save_mapping(o_chat, o_msg, t_chat, t_msg):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"SQLite Save Error: {e}")
+        logger.error(f"Błąd zapisu SQLite: {e}")
 
 def get_mapping(target_chat_id, reply_to_msg_id):
     try:
@@ -85,15 +88,14 @@ def get_mapping(target_chat_id, reply_to_msg_id):
         conn.close()
         return result[0] if result else None
     except Exception as e:
-        logger.error(f"SQLite Get Error: {e}")
+        logger.error(f"Błąd odczytu SQLite: {e}")
         return None
 
 async def translate_with_gemini(text, target_lang, api_key):
     if not api_key:
-        logger.warning(f"Brak klucza API dla {target_lang}. Sprawdź Variables w Koyeb.")
         return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
     
     lang_names = {
         "es": "Spanish",
@@ -113,25 +115,34 @@ async def translate_with_gemini(text, target_lang, api_key):
         }]
     }
 
-    for attempt in range(5):
+    # Wykładniczy backoff: 1s, 2s, 4s, 8s, 16s
+    backoff = [1, 2, 4, 8, 16]
+    
+    for attempt in range(6): # Do 5 powtórek + pierwsza próba
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=10) as response:
+                async with session.post(url, json=payload, timeout=15) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data['candidates'][0]['content']['parts'][0]['text'].strip()
-                    elif response.status == 429:
-                        await asyncio.sleep(2 ** attempt)
+                    elif response.status == 429: # Rate limit
+                        if attempt < len(backoff):
+                            await asyncio.sleep(backoff[attempt])
+                            continue
+                        break
                     else:
-                        logger.error(f"Gemini API Error {response.status}")
+                        logger.error(f"Błąd API Gemini: {response.status}")
                         break
         except Exception as e:
-            logger.error(f"Gemini Exception: {e}")
-            await asyncio.sleep(1)
+            if attempt < len(backoff):
+                await asyncio.sleep(backoff[attempt])
+            else:
+                logger.error(f"Wyjątek Gemini: {e}")
+                break
     return None
 
 async def translation_worker(worker_id):
-    logger.info(f"Worker {worker_id} (Gemini) wystartował.")
+    logger.info(f"Worker {worker_id} ({MODEL_NAME}) uruchomiony.")
     while True:
         task = await translation_queue.get()
         try:
@@ -150,7 +161,7 @@ async def translation_worker(worker_id):
                 api_key = GEMINI_KEYS.get(lang)
                 raw_translation = await translate_with_gemini(original_text, lang, api_key)
                 
-                content = html.escape(raw_translation) if raw_translation else "<i>(Błąd tłumaczenia AI)</i>"
+                content = html.escape(raw_translation) if raw_translation else "<i>(Błąd tłumaczenia)</i>"
                 final_html = f"<b>{source_label}</b>\n👤 {user_display}\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n{content}"
                 
                 reply_id = None
@@ -162,18 +173,19 @@ async def translation_worker(worker_id):
                         "chat_id": target_chat,
                         "message_thread_id": target_topic if target_topic != 0 else None,
                         "reply_to_message_id": reply_id,
-                        "parse_mode": ParseMode.HTML
+                        "parse_mode": ParseMode.HTML,
+                        "disable_web_page_preview": True
                     }
 
                     if any([message.photo, message.video, message.animation, message.document, message.audio, message.voice]):
                         sent = await message.copy_to(caption=final_html, **kwargs)
                     else:
-                        sent = await bot.send_message(text=final_html, disable_web_page_preview=True, **kwargs)
+                        sent = await bot.send_message(text=final_html, **kwargs)
 
                     if sent:
                         save_mapping(message.chat.id, message.message_id, target_chat, sent.message_id)
                 except Exception as e:
-                    logger.error(f"Błąd wysyłki do {lang}: {e}")
+                    logger.error(f"Błąd wysyłki: {e}")
 
         except Exception as e:
             logger.error(f"Błąd worker {worker_id}: {e}")

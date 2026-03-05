@@ -3,10 +3,12 @@ import logging
 import sqlite3
 import html
 import os
+import random
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter
 
 # =================================================================
 # SEKCJA KONFIGURACJI
@@ -14,17 +16,14 @@ from aiogram.enums import ParseMode
 
 MAIN_GROUP_ID = -1003676480681
 
-# ID TEMATÓW (TOPIC IDs)
 TOPIC_GENERAL = 0
 TOPIC_SPANISH = 27893
 TOPIC_ENGLISH = 37572
 TOPIC_RUSSIAN = 37576
 TOPIC_UKRAINIAN = 37575
 
-# TOKEN BOTA
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
-# KLUCZE API GEMINI
 GEMINI_KEYS = {
     "es": os.getenv("Spain", ""),
     "en": os.getenv("English", ""),
@@ -73,7 +72,7 @@ def save_mapping(o_chat, o_msg, t_chat, t_msg):
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"SQLite Save Error: {e}")
+        logger.error(f"Błąd SQLite Save: {e}")
 
 def get_mapping(target_chat_id, reply_to_msg_id):
     try:
@@ -87,16 +86,15 @@ def get_mapping(target_chat_id, reply_to_msg_id):
         conn.close()
         return result[0] if result else None
     except Exception as e:
-        logger.error(f"SQLite Get Error: {e}")
+        logger.error(f"Błąd SQLite Get: {e}")
         return None
 
 async def translate_single_lang(session, text, lang_config, original_message, source_label, user_display):
-    """Funkcja obsługująca tłumaczenie i wysyłkę dla pojedynczego języka."""
+    """Tłumaczenie i wysyłka z uwzględnieniem milisekundowych opóźnień."""
     target_chat, target_topic, lang = lang_config
     api_key = GEMINI_KEYS.get(lang)
     
     if not api_key:
-        logger.warning(f"Brak klucza API dla języka: {lang}")
         return
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
@@ -109,57 +107,65 @@ async def translate_single_lang(session, text, lang_config, original_message, so
     }
 
     raw_translation = None
-    backoff = [1, 2, 4, 8]
-    
-    # Próby tłumaczenia z backoffem
-    for attempt in range(len(backoff) + 1):
+    # Próby API Gemini z backoffem
+    for attempt in range(4):
         try:
             async with session.post(url, json=payload, timeout=12) as response:
                 if response.status == 200:
                     data = await response.json()
                     raw_translation = data['candidates'][0]['content']['parts'][0]['text'].strip()
                     break
-                elif response.status == 429 and attempt < len(backoff):
-                    await asyncio.sleep(backoff[attempt])
+                elif response.status == 429:
+                    await asyncio.sleep(1.5 ** attempt)
                 else:
-                    logger.error(f"API Error {response.status} dla {lang}")
                     break
-        except Exception as e:
-            if attempt < len(backoff):
-                await asyncio.sleep(backoff[attempt])
-            else:
-                logger.error(f"Exception for {lang}: {e}")
-                break
+        except Exception:
+            await asyncio.sleep(0.5)
 
-    # Budowa wiadomości i wysyłka
-    content = html.escape(raw_translation) if raw_translation else "<i>(Błąd tłumaczenia AI)</i>"
+    if not raw_translation:
+        raw_translation = "<i>(Błąd tłumaczenia AI)</i>"
+
+    content = html.escape(raw_translation)
     final_html = f"<b>{source_label}</b>\n👤 {user_display}\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n{content}"
     
     reply_id = None
     if original_message.reply_to_message:
         reply_id = get_mapping(target_chat, original_message.reply_to_message.message_id)
 
-    try:
-        kwargs = {
-            "chat_id": target_chat,
-            "message_thread_id": target_topic if target_topic != 0 else None,
-            "reply_to_message_id": reply_id,
-            "parse_mode": ParseMode.HTML,
-            "disable_web_page_preview": True
-        }
+    kwargs = {
+        "chat_id": target_chat,
+        "message_thread_id": target_topic if target_topic != 0 else None,
+        "reply_to_message_id": reply_id,
+        "parse_mode": ParseMode.HTML,
+        "disable_web_page_preview": True
+    }
 
-        if any([original_message.photo, original_message.video, original_message.animation, original_message.document, original_message.audio, original_message.voice]):
-            sent = await original_message.copy_to(caption=final_html, **kwargs)
-        else:
-            sent = await bot.send_message(text=final_html, **kwargs)
+    # DODANIE MILISEKUNDOWYCH OPÓŹNIEŃ (STAGGERING)
+    # Każdy język czeka losowo od 50 do 450ms, aby nie uderzyć w Telegram jednocześnie
+    stagger_delay = random.uniform(0.05, 0.45)
+    await asyncio.sleep(stagger_delay)
 
-        if sent:
-            save_mapping(original_message.chat.id, original_message.message_id, target_chat, sent.message_id)
-    except Exception as e:
-        logger.error(f"Błąd wysyłki {lang}: {e}")
+    # Mechanizm Retry dla Telegrama
+    for retry in range(5):
+        try:
+            if any([original_message.photo, original_message.video, original_message.animation, original_message.document, original_message.audio, original_message.voice]):
+                sent = await original_message.copy_to(caption=final_html, **kwargs)
+            else:
+                sent = await bot.send_message(text=final_html, **kwargs)
+            
+            if sent:
+                save_mapping(original_message.chat.id, original_message.message_id, target_chat, sent.message_id)
+            break
+
+        except TelegramRetryAfter as e:
+            logger.warning(f"Telegram Flood! Czekam {e.retry_after}s przed ponowną próbą dla {lang}")
+            await asyncio.sleep(e.retry_after + 0.1) # Dodatkowe 100ms zapasu
+        except Exception as e:
+            logger.error(f"Błąd wysyłki dla {lang}: {e}")
+            break
 
 async def translation_worker(worker_id):
-    logger.info(f"Worker {worker_id} ({MODEL_NAME}) gotowy.")
+    logger.info(f"Worker {worker_id} ({MODEL_NAME}) aktywny.")
     async with aiohttp.ClientSession() as session:
         while True:
             task = await translation_queue.get()
@@ -175,7 +181,7 @@ async def translation_worker(worker_id):
                 safe_name = html.escape(user.full_name) if user else "Użytkownik"
                 user_display = f'<b><a href="https://t.me/{user.username}">{safe_name}</a></b>' if user and user.username else f'<b>{safe_name}</b>'
                 
-                # URUCHOMIENIE WSZYSTKICH TŁUMACZEŃ RÓWNOLEGLE
+                # URUCHOMIENIE TŁUMACZEŃ RÓWNOLEGLE
                 tasks = [
                     translate_single_lang(session, original_text, cfg, message, source_label, user_display)
                     for cfg in target_configs
@@ -183,7 +189,7 @@ async def translation_worker(worker_id):
                 await asyncio.gather(*tasks)
 
             except Exception as e:
-                logger.error(f"Błąd krytyczny w workerze {worker_id}: {e}")
+                logger.error(f"Błąd krytyczny workera {worker_id}: {e}")
             
             translation_queue.task_done()
 
@@ -202,7 +208,6 @@ async def bridge_handler(message: types.Message):
 
     target_configs, source_label = [], ""
 
-    # Definicja celów
     if curr_topic == TOPIC_GENERAL:
         target_configs = [
             (MAIN_GROUP_ID, TOPIC_SPANISH, 'es'), 
@@ -225,10 +230,8 @@ async def bridge_handler(message: types.Message):
 
 async def main():
     init_db()
-    # Start workerów
     for i in range(MAX_WORKERS):
         asyncio.create_task(translation_worker(i + 1))
-    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

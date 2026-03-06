@@ -17,20 +17,20 @@ from aiogram.exceptions import TelegramRetryAfter
 MAIN_GROUP_ID = -1003676480681
 
 TOPIC_GENERAL = 0
-TOPIC_SPANISH = 27893
+TOPIC_SPANISH = 
 TOPIC_ENGLISH = 37572
-TOPIC_RUSSIAN = 37576
-TOPIC_UKRAINIAN = 37575
+TOPIC_RUSSIAN = 
+TOPIC_UKRAINIAN = 
 
 BOT_TOKEN = '8567902133:AAGBgYX0b4hdzbt0KOowa-gHDAqGwblboVE'
 
 # Klucze GSK z Koyeb
 GROQ_KEYS = {
-    "es": os.getenv("Spain", ""),
+    "es": os.getenv("m", ""),
     "en": os.getenv("English", ""),
-    "ru": os.getenv("Russia", ""),
-    "uk": os.getenv("Ukraine", ""),
-    "pl": os.getenv("Spain", "")
+    "ru": os.getenv("m", ""),
+    "uk": os.getenv("m", ""),
+    "pl": os.getenv("English ", "")
 }
 
 # Wybór modelu na podstawie Twoich screenów:
@@ -229,3 +229,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except:
         pass
+
